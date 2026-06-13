@@ -14,6 +14,7 @@ speaks to both SQLite and Postgres with the same code.
 """
 
 import os
+import threading
 
 from sqlalchemy import create_engine, text
 
@@ -49,16 +50,39 @@ _connect_args = {"check_same_thread": False} if _URL.startswith("sqlite") else {
 engine = create_engine(_URL, connect_args=_connect_args, pool_pre_ping=True)
 
 
+# Guards so the schema is built only once per process, even when Streamlit
+# calls ensure_db() from several threads at the same moment (which on Postgres
+# would otherwise race and collide creating the tables' hidden id sequences).
+_init_lock = threading.Lock()
+_db_ready = False
+
+
 def ensure_db():
-    """Create the three tables if they don't exist, and seed your targets once.
-    Safe to call on every startup. Works on both SQLite and Postgres — the only
-    line that differs between them is how an auto-numbering id is declared."""
+    """Create the tables + seed your targets once. Safe to call on every run."""
+    global _db_ready
+    if _db_ready:
+        return
+    with _init_lock:
+        if _db_ready:  # another thread finished while we waited for the lock
+            return
+        _create_schema()
+        _db_ready = True
+
+
+def _create_schema():
+    """Build the tables. Works on both SQLite and Postgres — the only line that
+    differs is how an auto-numbering id is declared."""
     if engine.dialect.name == "postgresql":
         pk = "id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY"
     else:  # sqlite
         pk = "id INTEGER PRIMARY KEY"
 
     with engine.begin() as conn:
+        # On Postgres, a transaction-level advisory lock serialises this DDL
+        # across every connection/container, so concurrent first-runs can't
+        # collide. (Harmless no-op concept on SQLite, so we skip it there.)
+        if engine.dialect.name == "postgresql":
+            conn.execute(text("SELECT pg_advisory_xact_lock(727274)"))
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS foods (
                 {pk},
