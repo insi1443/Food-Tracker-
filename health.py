@@ -67,6 +67,18 @@ def steps_to_kcal(steps, weight_kg):
     return steps * 0.04 * ((weight_kg or 70) / 70.0)
 
 
+# Approx METs (metabolic equivalent) for vigorous resistance training.
+STRENGTH_MET = 5.0
+
+
+def workout_kcal(minutes, weight_kg, met=STRENGTH_MET):
+    """Estimated calories burned for a strength session of `minutes` minutes.
+    kcal = METs x body-weight(kg) x hours. (Hevy shows duration, not calories.)"""
+    if not minutes:
+        return 0.0
+    return met * (weight_kg or 70) * (minutes / 60.0)
+
+
 def project_weight(latest_kg, kg_per_week, days_ahead):
     """Straight-line projection of weight `days_ahead` from now."""
     return latest_kg + kg_per_week * (days_ahead / 7.0)

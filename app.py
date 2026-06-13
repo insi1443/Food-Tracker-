@@ -493,6 +493,61 @@ def analyze_food_text(description):
     return json.loads(text_out)
 
 
+# Schema for reading a fitness screenshot (Apple steps/energy, or a Hevy workout).
+ACTIVITY_SHOT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"type": "string", "enum": ["steps", "workout", "other"]},
+        "steps": {"type": "number"},        # step count, 0 if none shown
+        "active_kcal": {"type": "number"},  # any calories/energy figure, 0 if none
+        "workout_minutes": {"type": "number"},  # workout duration, 0 if none
+        "summary": {"type": "string"},      # one-line description of what was read
+    },
+    "required": ["kind", "steps", "active_kcal", "workout_minutes", "summary"],
+    "additionalProperties": False,
+}
+
+ACTIVITY_PROMPT = (
+    "This is a screenshot from a fitness app. It is most likely either "
+    "(a) an Apple Health / Apple Fitness screen showing a step count and/or an "
+    "'Active Energy' / Move calories figure, or (b) a Hevy strength-training "
+    "workout summary showing the workout duration and exercises. Read it and "
+    "extract: the step count (0 if none shown); any calories / active-energy "
+    "number in kcal (0 if none); the workout duration in minutes (0 if none); "
+    "classify the kind; and write a short one-line summary of what you saw."
+)
+
+
+def analyze_activity_screenshot(image_bytes, media_type):
+    """Read a steps or workout screenshot and return a structured dict:
+    {kind, steps, active_kcal, workout_minutes, summary}."""
+    client = anthropic.Anthropic(api_key=get_secret("ANTHROPIC_API_KEY"))
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_b64,
+                        },
+                    },
+                    {"type": "text", "text": ACTIVITY_PROMPT},
+                ],
+            }
+        ],
+        output_config={"format": {"type": "json_schema", "schema": ACTIVITY_SHOT_SCHEMA}},
+    )
+    text_out = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text_out)
+
+
 def save_ai_items(items, meal_type, source="AI photo"):
     """
     Save a list of Claude-estimated food items to the database. `source` records
@@ -930,7 +985,9 @@ def page_profile():
 # ----------------------------------------------------------------------
 def page_body():
     st.header("⚖️ Body & activity")
-    weigh_tab, activity_tab = st.tabs(["Weigh-in", "Steps & exercise"])
+    weigh_tab, activity_tab, import_tab = st.tabs(
+        ["Weigh-in", "Steps & exercise", "📷 Import"]
+    )
 
     with weigh_tab:
         col1, col2, col3 = st.columns(3)
@@ -978,6 +1035,75 @@ def page_body():
                 f"~{health.steps_to_kcal(steps, weight):.0f} kcal estimated from "
                 f"{steps:,} steps."
             )
+
+    with import_tab:
+        _import_tab()
+
+
+def _import_tab():
+    """Read a steps or Hevy-workout screenshot and turn it into a day's activity."""
+    st.caption(
+        "Upload a screenshot of your **Apple steps / Active Energy** or a **Hevy "
+        "workout** — Claude reads it and fills in the numbers below."
+    )
+    idate = st.date_input("Date", value=date.today(), key="imp_date")
+    shot = st.file_uploader(
+        "Screenshot", type=["jpg", "jpeg", "png", "webp"], key="imp_shot"
+    )
+    if shot is not None:
+        st.image(shot, width=240)
+        if st.button("Read screenshot", type="primary", key="imp_read"):
+            with st.spinner("Claude is reading your screenshot…"):
+                try:
+                    st.session_state["activity_shot"] = analyze_activity_screenshot(
+                        shot.getvalue(), shot.type
+                    )
+                except Exception as e:
+                    st.error(f"Couldn't read it: {e}")
+
+    res = st.session_state.get("activity_shot")
+    if not res:
+        return
+
+    st.info(f"Read: {res.get('summary', '')}")
+    weight, _, _ = get_latest_weight()
+    current = get_activity_for(idate.isoformat())
+
+    # Suggested values from the screenshot, falling back to what's already logged.
+    sugg_steps = int(res.get("steps") or 0) or int(current["steps"])
+    wmin = res.get("workout_minutes") or 0
+    active = res.get("active_kcal") or 0
+    # Prefer a workout-duration estimate; otherwise use an on-screen calorie number.
+    sugg_ex = round(health.workout_kcal(wmin, weight)) if wmin else round(active)
+    sugg_ex = sugg_ex or int(current["exercise_kcal"])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        steps_val = st.number_input(
+            "Steps", 0, 100000, value=sugg_steps, step=500, key="imp_steps"
+        )
+    with col2:
+        ex_val = st.number_input(
+            "Exercise calories", 0, 5000, value=sugg_ex, step=25, key="imp_ex"
+        )
+    note = st.text_input("Note", value=(res.get("summary", "") or "")[:80], key="imp_note")
+
+    if wmin:
+        st.caption(
+            f"~{health.workout_kcal(wmin, weight):.0f} kcal estimated from a "
+            f"{wmin:.0f}-min strength session (Hevy shows duration, not calories)."
+        )
+    if active and not wmin:
+        st.caption(
+            "Looks like an on-screen calorie figure (e.g. Apple Active Energy). "
+            "If that number already covers *all* your daily movement, set Steps to "
+            "0 here so walking isn't counted twice."
+        )
+
+    if st.button("Save to this day", type="primary", key="imp_save"):
+        save_activity(idate.isoformat(), int(steps_val), float(ex_val), note)
+        st.success(f"Saved activity for {idate.isoformat()}.")
+        del st.session_state["activity_shot"]
 
 
 # ----------------------------------------------------------------------
