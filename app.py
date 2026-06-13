@@ -465,11 +465,40 @@ def analyze_food_photo(image_bytes, media_type):
     return json.loads(text)
 
 
-def save_photo_items(items, meal_type):
+TEXT_PROMPT = (
+    "You are a nutrition assistant. The user describes what they ate in plain "
+    "language — it may include local or brand names (e.g. 'Ya Kun kaya toast "
+    "set'), portion hints ('half', 'shared with a friend'), and drinks. "
+    "Identify each distinct food/drink item and estimate the portion in grams "
+    "and the calories, protein, carbs and fat for the amount THEY actually ate "
+    "(account for sharing / half portions). Use your knowledge of common foods "
+    "and brands, including Singaporean dishes. Also guess which meal it is. "
+    "Give your best estimate even when you're unsure."
+)
+
+
+def analyze_food_text(description):
+    """Send a plain-language food description to Claude and get back the same
+    structured estimate shape as the photo flow (a dict with items + meal_guess)."""
+    client = anthropic.Anthropic(api_key=get_secret("ANTHROPIC_API_KEY"))
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=2048,
+        messages=[
+            {"role": "user", "content": f"{TEXT_PROMPT}\n\nWhat I ate: {description}"}
+        ],
+        output_config={"format": {"type": "json_schema", "schema": FOOD_SCHEMA}},
+    )
+    text_out = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text_out)
+
+
+def save_ai_items(items, meal_type, source="AI photo"):
     """
-    Save a list of photo-derived food items to the database.
-    Unlike the USDA path, Claude already gives us the totals for the actual
-    portion eaten, so we store those numbers directly (no per-100g scaling).
+    Save a list of Claude-estimated food items to the database. `source` records
+    HOW it was logged ("AI photo" or "AI text"). Unlike the USDA path, Claude
+    already gives totals for the actual portion eaten, so we store those numbers
+    directly (no per-100g scaling).
     """
     today = date.today().isoformat()
     with engine.begin() as conn:
@@ -483,7 +512,7 @@ def save_photo_items(items, meal_type):
 
             food_id = conn.execute(text("""
                 INSERT INTO foods (name, calories_per_100g, protein_g, carbs_g, fat_g, source)
-                VALUES (:n, :cal, :p, :c, :f, 'AI photo')
+                VALUES (:n, :cal, :p, :c, :f, :src)
                 RETURNING id
             """), {
                 "n": it["name"],
@@ -491,6 +520,7 @@ def save_photo_items(items, meal_type):
                 "p": per_100g(it["protein_g"]),
                 "c": per_100g(it["carbs_g"]),
                 "f": per_100g(it["fat_g"]),
+                "src": source,
             }).scalar()
 
             conn.execute(text("""
@@ -517,82 +547,107 @@ def save_photo_items(items, meal_type):
 def page_log_food():
     st.header("🍽️ Log Food")
 
-    # st.tabs creates clickable tabs. The photo tab is first (your main flow);
-    # the search tab is the typed backup.
-    photo_tab, search_tab = st.tabs(["📷 Photo", "🔍 Search"])
+    # Three ways to log: snap a photo, describe it in words, or type-search USDA.
+    photo_tab, describe_tab, search_tab = st.tabs(
+        ["📷 Photo", "✍️ Describe", "🔍 Search"]
+    )
     with photo_tab:
         _photo_tab()
+    with describe_tab:
+        _describe_tab()
     with search_tab:
         _search_tab()
+
+
+def _review_estimate(result, state_key, source):
+    """Shared UI: show Claude's estimate as an editable table, pick the meal,
+    and save. Used by both the Photo and Describe tabs. `state_key` keeps each
+    tab's widgets separate; `source` records how it was logged."""
+    if not (result and result.get("items")):
+        return
+
+    st.write("**Claude's estimate** — edit any number, then save:")
+    rows = [
+        {
+            "Food": it["name"],
+            "Grams": it["estimated_grams"],
+            "Calories": it["calories"],
+            "Protein (g)": it["protein_g"],
+            "Carbs (g)": it["carbs_g"],
+            "Fat (g)": it["fat_g"],
+        }
+        for it in result["items"]
+    ]
+    # num_rows="dynamic" lets you delete rows you don't want.
+    edited = st.data_editor(
+        rows, num_rows="dynamic", hide_index=True,
+        use_container_width=True, key=f"editor_{state_key}",
+    )
+
+    meals = ["breakfast", "lunch", "dinner", "snack"]
+    guess = result.get("meal_guess", "lunch")
+    meal_type = st.selectbox(
+        "Meal type", meals,
+        index=meals.index(guess) if guess in meals else 1,
+        key=f"meal_{state_key}",
+    )
+
+    if st.button("Add all to log", type="primary", key=f"save_{state_key}"):
+        items = [
+            {
+                "name": r["Food"],
+                "estimated_grams": r["Grams"],
+                "calories": r["Calories"],
+                "protein_g": r["Protein (g)"],
+                "carbs_g": r["Carbs (g)"],
+                "fat_g": r["Fat (g)"],
+            }
+            for r in edited
+        ]
+        save_ai_items(items, meal_type, source)
+        st.success(f"Logged {len(items)} item(s) as {meal_type}.")
+        del st.session_state[state_key]  # clear so the table disappears
 
 
 def _photo_tab():
     """Upload a food photo, let Claude estimate it, review, then log."""
     st.caption("Snap or upload a photo and Claude will estimate the macros.")
 
-    uploaded = st.file_uploader(
-        "Food photo", type=["jpg", "jpeg", "png", "webp"]
-    )
-
+    uploaded = st.file_uploader("Food photo", type=["jpg", "jpeg", "png", "webp"])
     if uploaded is not None:
-        # Show the picture back to the user.
         st.image(uploaded, caption="Your photo", width=300)
-
         if st.button("Analyze photo", type="primary"):
             with st.spinner("Claude is looking at your food…"):
                 try:
-                    image_bytes = uploaded.getvalue()  # raw bytes of the file
-                    result = analyze_food_photo(image_bytes, uploaded.type)
+                    result = analyze_food_photo(uploaded.getvalue(), uploaded.type)
                     st.session_state["photo_result"] = result
                 except Exception as e:
                     st.error(f"Photo analysis failed: {e}")
 
-    # If we have an analysis, show it as an EDITABLE table so you can correct
-    # Claude's estimates before saving.
-    result = st.session_state.get("photo_result")
-    if result and result.get("items"):
-        st.write("**Claude's estimate** — edit any number, then save:")
-        # Turn the items into friendly-named rows for the editor.
-        rows = [
-            {
-                "Food": it["name"],
-                "Grams": it["estimated_grams"],
-                "Calories": it["calories"],
-                "Protein (g)": it["protein_g"],
-                "Carbs (g)": it["carbs_g"],
-                "Fat (g)": it["fat_g"],
-            }
-            for it in result["items"]
-        ]
-        # num_rows="dynamic" lets you delete rows you don't want.
-        edited = st.data_editor(
-            rows, num_rows="dynamic", hide_index=True, use_container_width=True
-        )
+    _review_estimate(st.session_state.get("photo_result"), "photo_result", "AI photo")
 
-        # Default the meal dropdown to Claude's guess.
-        meals = ["breakfast", "lunch", "dinner", "snack"]
-        guess = result.get("meal_guess", "lunch")
-        meal_type = st.selectbox(
-            "Meal type", meals, index=meals.index(guess) if guess in meals else 1
-        )
 
-        if st.button("Add all to log", type="primary"):
-            # Convert the edited friendly rows back into the internal shape.
-            items = [
-                {
-                    "name": r["Food"],
-                    "estimated_grams": r["Grams"],
-                    "calories": r["Calories"],
-                    "protein_g": r["Protein (g)"],
-                    "carbs_g": r["Carbs (g)"],
-                    "fat_g": r["Fat (g)"],
-                }
-                for r in edited
-            ]
-            save_photo_items(items, meal_type)
-            st.success(f"Logged {len(items)} item(s) as {meal_type}.")
-            # Clear so the table disappears after saving.
-            del st.session_state["photo_result"]
+def _describe_tab():
+    """Type what you ate; Claude estimates it from its food knowledge."""
+    st.caption(
+        "Type what you ate (great for known dishes you didn't photograph) and "
+        "Claude estimates the macros. Include portion hints like 'half' or 'shared'."
+    )
+
+    desc = st.text_area(
+        "What did you eat?",
+        placeholder="e.g. half a Ya Kun kaya toast set, shared — 2 kaya toast, "
+        "2 soft-boiled eggs, 1 kopi",
+        key="desc_text",
+    )
+    if st.button("Estimate", type="primary", key="desc_btn") and desc.strip():
+        with st.spinner("Claude is estimating…"):
+            try:
+                st.session_state["text_result"] = analyze_food_text(desc)
+            except Exception as e:
+                st.error(f"Estimate failed: {e}")
+
+    _review_estimate(st.session_state.get("text_result"), "text_result", "AI text")
 
 
 def _search_tab():
