@@ -806,7 +806,8 @@ def _range_row(label, total, lo, hi, unit, kind):
         f"**{label}:** {total:.0f} / {lo:.0f}–{hi:.0f} {unit}  "
         f"({pct * 100:.0f}% of top)  {status}"
     )
-    st.progress(min(pct, 1.0))
+    # Clamp to [0, 1] — net calories can be negative before you've eaten.
+    st.progress(min(max(pct, 0.0), 1.0))
 
 
 def _render_day_view(day_iso):
@@ -814,30 +815,30 @@ def _render_day_view(day_iso):
     Shared by the Dashboard (today) and the Calendar (any day)."""
     totals = get_totals_for(day_iso)
     targets = get_active_targets()
+    out_kcal, act = calories_out_for(day_iso)
+    food = totals["calories"]
+    net = food - out_kcal  # what you ate, minus what you burned moving
 
-    # Calories: a ceiling to stay under. Protein: a floor to reach.
-    _range_row(
-        "Calories", totals["calories"],
-        targets.get("calorie_min"), targets.get("calorie_max"), "kcal", "ceiling",
-    )
+    # MAIN calorie bar now reflects NET calories (food − activity), so it tells
+    # you how much room is left once everything is accounted for.
+    cmin, cmax = targets.get("calorie_min"), targets.get("calorie_max")
+    cal_label = "Calories (after activity)" if out_kcal > 0 else "Calories"
+    _range_row(cal_label, net, cmin, cmax, "kcal", "ceiling")
+    if cmax:
+        remaining = cmax - net
+        detail = f" · ate {food:.0f}, burned {out_kcal:.0f}" if out_kcal > 0 else ""
+        if remaining >= 0:
+            st.caption(f"🍽️ **{remaining:.0f} kcal left** to your ceiling{detail}.")
+        else:
+            st.caption(f"⚠️ **{-remaining:.0f} kcal over** your ceiling{detail}.")
+
+    # Protein floor; carbs/fat are running totals (not affected by activity).
     _range_row(
         "Protein", totals["protein_g"],
         targets.get("protein_min"), targets.get("protein_max"), "g", "floor",
     )
-    # Carbs and fat have no target yet — these just show the running total.
     _progress_row("Carbs", totals["carbs_g"], targets.get("carb_target"), "g")
     _progress_row("Fat", totals["fat_g"], targets.get("fat_target"), "g")
-
-    # Calories burned (steps + exercise), the resulting net intake, and — when we
-    # have a maintenance estimate from your profile — the day's calorie deficit.
-    out_kcal, act = calories_out_for(day_iso)
-    food = totals["calories"]
-    if out_kcal > 0:
-        st.caption(
-            f"Activity out: ~{out_kcal:.0f} kcal "
-            f"({act['steps']:,} steps + {act['exercise_kcal']:.0f} exercise)  ·  "
-            f"**Net intake: {food - out_kcal:.0f} kcal**"
-        )
 
     if targets.get("dynamic") and food > 0:
         total_burn = targets["tdee"] + out_kcal           # maintenance + extra activity
