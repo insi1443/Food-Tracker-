@@ -130,7 +130,8 @@ def _create_schema():
                 goal_weight_kg  REAL,
                 goal_bodyfat_pct REAL,
                 trip_date       TEXT,
-                deficit_kcal    REAL
+                deficit_kcal    REAL,
+                fat_per_kg      REAL
             )
         """))
         # Every weigh-in.
@@ -160,3 +161,26 @@ def _create_schema():
                     (calorie_min, calorie_max, protein_min, protein_max, carb_target, fat_target)
                 VALUES (1600, 2000, 120, 140, NULL, NULL)
             """))
+
+    # Migrations: add columns that newer versions need to databases created by
+    # an older version (CREATE TABLE IF NOT EXISTS won't add a column).
+    _add_column_if_missing("profile", "fat_per_kg", "REAL")
+
+
+def _add_column_if_missing(table, column, coltype):
+    """Add `column` to `table` only if it isn't already there. Works on both
+    Postgres and SQLite. Table/column names are fixed literals (no user input)."""
+    try:
+        with engine.begin() as conn:
+            if engine.dialect.name == "postgresql":
+                conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {coltype}")
+                )
+            else:  # sqlite has no "IF NOT EXISTS" for columns — check first
+                existing = [
+                    r[1] for r in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+                ]
+                if column not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
+    except Exception:
+        pass  # if it already exists or the table isn't there yet, ignore

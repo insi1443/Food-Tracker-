@@ -201,13 +201,13 @@ def get_profile():
     with engine.connect() as conn:
         row = conn.execute(text("""
             SELECT height_cm, age, sex, activity_factor, goal_weight_kg,
-                   goal_bodyfat_pct, trip_date, deficit_kcal
+                   goal_bodyfat_pct, trip_date, deficit_kcal, fat_per_kg
             FROM profile LIMIT 1
         """)).fetchone()
     if row is None:
         return None
     keys = ["height_cm", "age", "sex", "activity_factor", "goal_weight_kg",
-            "goal_bodyfat_pct", "trip_date", "deficit_kcal"]
+            "goal_bodyfat_pct", "trip_date", "deficit_kcal", "fat_per_kg"]
     return dict(zip(keys, row))
 
 
@@ -221,16 +221,16 @@ def save_profile(p):
                     height_cm = :height_cm, age = :age, sex = :sex,
                     activity_factor = :activity_factor, goal_weight_kg = :goal_weight_kg,
                     goal_bodyfat_pct = :goal_bodyfat_pct, trip_date = :trip_date,
-                    deficit_kcal = :deficit_kcal
+                    deficit_kcal = :deficit_kcal, fat_per_kg = :fat_per_kg
                 WHERE id = :id
             """), {**p, "id": existing[0]})
         else:
             conn.execute(text("""
                 INSERT INTO profile
                     (height_cm, age, sex, activity_factor, goal_weight_kg,
-                     goal_bodyfat_pct, trip_date, deficit_kcal)
+                     goal_bodyfat_pct, trip_date, deficit_kcal, fat_per_kg)
                 VALUES (:height_cm, :age, :sex, :activity_factor, :goal_weight_kg,
-                        :goal_bodyfat_pct, :trip_date, :deficit_kcal)
+                        :goal_bodyfat_pct, :trip_date, :deficit_kcal, :fat_per_kg)
             """), p)
 
 
@@ -306,8 +306,9 @@ def get_active_targets():
         deficit = profile.get("deficit_kcal") or 500
         cmin, cmax = health.calorie_targets(maintenance, deficit)
         pmin, pmax = health.protein_targets(weight, body_fat)
-        # Fat anchored to body weight; carbs fill the calories left at the ceiling.
-        fat = health.fat_target_g(weight)
+        # Fat anchored to body weight (uses your Profile slider); carbs fill the
+        # calories left at the ceiling.
+        fat = health.fat_target_g(weight, profile.get("fat_per_kg") or health.FAT_PER_KG)
         carbs = health.carb_target_g(cmax, pmax, fat)
         return {
             "calorie_min": cmin, "calorie_max": cmax,
@@ -988,6 +989,33 @@ def page_profile():
             value=date.fromisoformat(p["trip_date"]) if p.get("trip_date") else date.today(),
         )
 
+    st.divider()
+    st.write("**Fat / carb split**")
+    fat_per_kg = st.slider(
+        "Fat (grams per kg of body weight)",
+        min_value=0.4, max_value=1.2,
+        value=float(p.get("fat_per_kg") or health.FAT_PER_KG), step=0.05,
+        help="Lower = more carbs (training energy). Higher = more fat. "
+        "~0.8 is a healthy middle for a cut. Carbs fill whatever calories are left.",
+    )
+
+    # Live preview of what this slider does to your fat & carb targets.
+    weight, body_fat, _ = get_latest_weight()
+    if weight:
+        maintenance = health.tdee(
+            weight, height, int(age), sex, health.ACTIVITY_FACTORS[activity_label]
+        )
+        _, cmax = health.calorie_targets(maintenance, deficit)
+        _, pmax = health.protein_targets(weight, body_fat)
+        fat_g = health.fat_target_g(weight, fat_per_kg)
+        carbs_g = health.carb_target_g(cmax, pmax, fat_g)
+        st.caption(
+            f"At {weight:.0f} kg → **fat ~{fat_g} g** ({fat_g * 9 / cmax * 100:.0f}% of "
+            f"{cmax:.0f} kcal) · **carbs ~{carbs_g} g** · protein ~{pmax} g."
+        )
+    else:
+        st.caption("Log a weight under Body & Activity to preview the gram targets.")
+
     if st.button("Save profile", type="primary"):
         save_profile({
             "height_cm": height,
@@ -998,6 +1026,7 @@ def page_profile():
             "goal_bodyfat_pct": goal_bf or None,
             "trip_date": trip.isoformat(),
             "deficit_kcal": deficit,
+            "fat_per_kg": fat_per_kg,
         })
         st.success("Profile saved. Your targets will now adjust to your weight.")
 
