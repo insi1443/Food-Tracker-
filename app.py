@@ -13,6 +13,7 @@ Then open the URL it prints (usually http://localhost:8501).
 import base64
 import json
 import os
+import uuid
 from datetime import date, timedelta
 
 import anthropic         # the Claude SDK — analyses food photos
@@ -127,7 +128,8 @@ def get_logs_for(day_iso):
     The first column is the row `id`, which we need in order to delete it."""
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT id, meal_type, food_name, quantity_g, calories, protein_g, carbs_g, fat_g
+            SELECT id, meal_type, food_name, quantity_g, calories, protein_g,
+                   carbs_g, fat_g, group_id
             FROM logs
             WHERE date = :day
             ORDER BY id DESC
@@ -145,6 +147,12 @@ def delete_log(log_id):
     """Delete a single log entry by its row id."""
     with engine.begin() as conn:  # begin() = run inside a transaction and commit
         conn.execute(text("DELETE FROM logs WHERE id = :id"), {"id": log_id})
+
+
+def delete_log_group(group_id):
+    """Delete every log row that was saved together (one whole order/meal)."""
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM logs WHERE group_id = :g"), {"g": group_id})
 
 
 def save_food_and_log(food, quantity_g, meal_type):
@@ -178,8 +186,8 @@ def save_food_and_log(food, quantity_g, meal_type):
         conn.execute(text("""
             INSERT INTO logs
                 (date, food_id, food_name, quantity_g, meal_type,
-                 calories, protein_g, carbs_g, fat_g)
-            VALUES (:date, :fid, :name, :qty, :meal, :cal, :p, :c, :f)
+                 calories, protein_g, carbs_g, fat_g, group_id)
+            VALUES (:date, :fid, :name, :qty, :meal, :cal, :p, :c, :f, :gid)
         """), {
             "date": date.today().isoformat(),
             "fid": food_id,
@@ -190,6 +198,7 @@ def save_food_and_log(food, quantity_g, meal_type):
             "p": round(food["protein_g"] * factor, 1),
             "c": round(food["carbs_g"] * factor, 1),
             "f": round(food["fat_g"] * factor, 1),
+            "gid": uuid.uuid4().hex,  # its own one-item group
         })
 
 
@@ -560,6 +569,7 @@ def save_ai_items(items, meal_type, source="AI photo"):
     directly (no per-100g scaling).
     """
     today = date.today().isoformat()
+    group_id = uuid.uuid4().hex  # all items in this submission share one group
     with engine.begin() as conn:
         for it in items:
             grams = it["estimated_grams"] or 0
@@ -585,8 +595,8 @@ def save_ai_items(items, meal_type, source="AI photo"):
             conn.execute(text("""
                 INSERT INTO logs
                     (date, food_id, food_name, quantity_g, meal_type,
-                     calories, protein_g, carbs_g, fat_g)
-                VALUES (:date, :fid, :name, :qty, :meal, :cal, :p, :c, :f)
+                     calories, protein_g, carbs_g, fat_g, group_id)
+                VALUES (:date, :fid, :name, :qty, :meal, :cal, :p, :c, :f, :gid)
             """), {
                 "date": today,
                 "fid": food_id,
@@ -597,6 +607,7 @@ def save_ai_items(items, meal_type, source="AI photo"):
                 "p": round(it["protein_g"], 1),
                 "c": round(it["carbs_g"], 1),
                 "f": round(it["fat_g"], 1),
+                "gid": group_id,
             })
 
 
@@ -861,26 +872,50 @@ def _render_day_view(day_iso):
             )
         st.caption("Running estimate — most accurate once the day's food is fully logged.")
 
-    # A list of everything logged that day, each with a delete button.
+    # Entries, grouped by what was logged together (so a multi-item order can be
+    # removed in one tap, while individual items stay deletable too).
     st.subheader("Entries")
     logs = get_logs_for(day_iso)
-    if logs:
-        for row in logs:
-            log_id, meal, food, qty, cal, prot, carb, fat = row
-            # Two columns: the entry text, and a small delete button.
+    if not logs:
+        st.info("Nothing logged on this day.")
+        return
+
+    # Bucket rows by group_id, keeping newest-first order. Rows with no group_id
+    # (older entries) each become their own single-item bucket.
+    groups, seen = [], {}
+    for row in logs:
+        gid = row[8]
+        key = gid if gid is not None else f"solo-{row[0]}"
+        if key not in seen:
+            seen[key] = len(groups)
+            groups.append([key, gid, []])
+        groups[seen[key]][2].append(row)
+
+    for key, gid, rows in groups:
+        multi = len(rows) > 1
+        if multi:
+            total = sum(r[4] for r in rows)
+            st.markdown(
+                f"**{rows[0][1].title()} order** · {len(rows)} items · {total:.0f} kcal"
+            )
+        for r in rows:
+            log_id, meal, food, qty, cal, prot, carb, fat = r[:8]
             text_col, btn_col = st.columns([6, 1])
             with text_col:
+                prefix = "· " if multi else f"**{meal.title()}** — "
                 st.write(
-                    f"**{meal.title()}** — {food}  ·  {qty:.0f} g  ·  "
-                    f"{cal:.0f} kcal  ·  {prot:.0f}P / {carb:.0f}C / {fat:.0f}F"
+                    f"{prefix}{food}  ·  {qty:.0f} g  ·  {cal:.0f} kcal  ·  "
+                    f"{prot:.0f}P / {carb:.0f}C / {fat:.0f}F"
                 )
             with btn_col:
-                # key must be unique per row, so we use the log id.
-                if st.button("🗑️", key=f"del_{log_id}", help="Delete this entry"):
+                if st.button("🗑️", key=f"del_{log_id}", help="Delete this item"):
                     delete_log(log_id)
-                    st.rerun()  # reload the page so totals + list update
-    else:
-        st.info("Nothing logged on this day.")
+                    st.rerun()
+        if multi:
+            if st.button("🗑️ Remove whole order", key=f"delgrp_{key}"):
+                delete_log_group(gid)
+                st.rerun()
+            st.divider()
 
 
 def _trip_panel():

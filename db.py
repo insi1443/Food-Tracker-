@@ -105,7 +105,8 @@ def _create_schema():
                 calories   REAL,
                 protein_g  REAL,
                 carbs_g    REAL,
-                fat_g      REAL
+                fat_g      REAL,
+                group_id   TEXT
             )
         """))
         conn.execute(text(f"""
@@ -165,6 +166,7 @@ def _create_schema():
     # Migrations: add columns that newer versions need to databases created by
     # an older version (CREATE TABLE IF NOT EXISTS won't add a column).
     _add_column_if_missing("profile", "fat_per_kg", "REAL")
+    _add_column_if_missing("logs", "group_id", "TEXT")
 
 
 def _add_column_if_missing(table, column, coltype):
