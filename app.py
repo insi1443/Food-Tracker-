@@ -10,13 +10,16 @@ Run it with:   streamlit run app.py
 Then open the URL it prints (usually http://localhost:8501).
 """
 
+import base64
+import json
 import os
 import sqlite3
 from datetime import date
 
+import anthropic         # the Claude SDK — analyses food photos
 import requests          # for calling the USDA web API
 import streamlit as st   # the web-app framework
-from dotenv import load_dotenv  # reads your API key out of the .env file
+from dotenv import load_dotenv  # reads your API keys out of the .env file
 
 # Load variables from the .env file into the environment so we can read them.
 load_dotenv()
@@ -25,6 +28,10 @@ DB_NAME = "foodtracker.db"
 
 # The USDA FoodData Central search endpoint.
 USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
+
+# The Claude model we use to look at photos. Opus 4.8 is Anthropic's most
+# capable model and supports vision (reading images).
+CLAUDE_MODEL = "claude-opus-4-8"
 
 
 # ----------------------------------------------------------------------
@@ -41,17 +48,22 @@ def get_targets():
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT calorie_target, protein_target, carb_target, fat_target FROM targets LIMIT 1"
+        """
+        SELECT calorie_min, calorie_max, protein_min, protein_max, carb_target, fat_target
+        FROM targets LIMIT 1
+        """
     )
     row = cur.fetchone()
     conn.close()
     if row is None:
         return None
     return {
-        "calorie_target": row[0],
-        "protein_target": row[1],
-        "carb_target": row[2],
-        "fat_target": row[3],
+        "calorie_min": row[0],
+        "calorie_max": row[1],
+        "protein_min": row[2],
+        "protein_max": row[3],
+        "carb_target": row[4],
+        "fat_target": row[5],
     }
 
 
@@ -210,11 +222,240 @@ def search_usda(query):
 
 
 # ----------------------------------------------------------------------
+# CLAUDE PHOTO ANALYSIS
+# Send a food photo to Claude and get back a structured estimate.
+# ----------------------------------------------------------------------
+
+# This describes the EXACT shape of JSON we want back. Passing a schema (a
+# "structured output") forces Claude to reply with valid JSON in this format,
+# so we never have to guess or parse free-form text.
+FOOD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "estimated_grams": {"type": "number"},
+                    "calories": {"type": "number"},
+                    "protein_g": {"type": "number"},
+                    "carbs_g": {"type": "number"},
+                    "fat_g": {"type": "number"},
+                },
+                "required": [
+                    "name", "estimated_grams", "calories",
+                    "protein_g", "carbs_g", "fat_g",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "meal_guess": {
+            "type": "string",
+            "enum": ["breakfast", "lunch", "dinner", "snack"],
+        },
+    },
+    "required": ["items", "meal_guess"],
+    "additionalProperties": False,
+}
+
+PHOTO_PROMPT = (
+    "You are a nutrition assistant. Look at this photo of food and identify "
+    "each distinct food item you can see. For EACH item, estimate the portion "
+    "size in grams and the calories, protein, carbohydrates, and fat for that "
+    "portion (not per 100g — the actual amount shown). If several foods share "
+    "one plate, list them separately. Also guess which meal this most likely "
+    "is. Give your best estimate even when you're unsure."
+)
+
+
+def analyze_food_photo(image_bytes, media_type):
+    """
+    Send the uploaded image to Claude and return a Python dict like:
+        {"items": [{"name": ..., "estimated_grams": ..., "calories": ...}],
+         "meal_guess": "lunch"}
+    `media_type` is something like "image/jpeg" or "image/png".
+    """
+    # anthropic.Anthropic() automatically reads ANTHROPIC_API_KEY from the
+    # environment (which load_dotenv put there from your .env file).
+    client = anthropic.Anthropic()
+
+    # Images are sent as base64 text — a way of writing binary data as letters.
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=2048,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_b64,
+                        },
+                    },
+                    {"type": "text", "text": PHOTO_PROMPT},
+                ],
+            }
+        ],
+        # This is what guarantees Claude replies in our JSON shape.
+        output_config={"format": {"type": "json_schema", "schema": FOOD_SCHEMA}},
+    )
+
+    # The reply's first text block is guaranteed-valid JSON, so we parse it.
+    text = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text)
+
+
+def save_photo_items(items, meal_type):
+    """
+    Save a list of photo-derived food items to the database.
+    Unlike the USDA path, Claude already gives us the totals for the actual
+    portion eaten, so we store those numbers directly (no per-100g scaling).
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    today = date.today().isoformat()
+
+    for it in items:
+        grams = it["estimated_grams"] or 0
+
+        # We also keep a per-100g row in `foods` so the foods table stays
+        # consistent with the USDA entries. Guard against divide-by-zero.
+        def per_100g(value):
+            return round(value / grams * 100, 1) if grams else 0
+
+        cur.execute(
+            """
+            INSERT INTO foods (name, calories_per_100g, protein_g, carbs_g, fat_g, source)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                it["name"],
+                per_100g(it["calories"]),
+                per_100g(it["protein_g"]),
+                per_100g(it["carbs_g"]),
+                per_100g(it["fat_g"]),
+                "AI photo",
+            ),
+        )
+        food_id = cur.lastrowid
+
+        cur.execute(
+            """
+            INSERT INTO logs
+                (date, food_id, food_name, quantity_g, meal_type,
+                 calories, protein_g, carbs_g, fat_g)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                today,
+                food_id,
+                it["name"],
+                grams,
+                meal_type,
+                round(it["calories"], 1),
+                round(it["protein_g"], 1),
+                round(it["carbs_g"], 1),
+                round(it["fat_g"], 1),
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+# ----------------------------------------------------------------------
 # PAGE 1: LOG FOOD
 # ----------------------------------------------------------------------
 def page_log_food():
     st.header("🍽️ Log Food")
 
+    # st.tabs creates clickable tabs. The photo tab is first (your main flow);
+    # the search tab is the typed backup.
+    photo_tab, search_tab = st.tabs(["📷 Photo", "🔍 Search"])
+    with photo_tab:
+        _photo_tab()
+    with search_tab:
+        _search_tab()
+
+
+def _photo_tab():
+    """Upload a food photo, let Claude estimate it, review, then log."""
+    st.caption("Snap or upload a photo and Claude will estimate the macros.")
+
+    uploaded = st.file_uploader(
+        "Food photo", type=["jpg", "jpeg", "png", "webp"]
+    )
+
+    if uploaded is not None:
+        # Show the picture back to the user.
+        st.image(uploaded, caption="Your photo", width=300)
+
+        if st.button("Analyze photo", type="primary"):
+            with st.spinner("Claude is looking at your food…"):
+                try:
+                    image_bytes = uploaded.getvalue()  # raw bytes of the file
+                    result = analyze_food_photo(image_bytes, uploaded.type)
+                    st.session_state["photo_result"] = result
+                except Exception as e:
+                    st.error(f"Photo analysis failed: {e}")
+
+    # If we have an analysis, show it as an EDITABLE table so you can correct
+    # Claude's estimates before saving.
+    result = st.session_state.get("photo_result")
+    if result and result.get("items"):
+        st.write("**Claude's estimate** — edit any number, then save:")
+        # Turn the items into friendly-named rows for the editor.
+        rows = [
+            {
+                "Food": it["name"],
+                "Grams": it["estimated_grams"],
+                "Calories": it["calories"],
+                "Protein (g)": it["protein_g"],
+                "Carbs (g)": it["carbs_g"],
+                "Fat (g)": it["fat_g"],
+            }
+            for it in result["items"]
+        ]
+        # num_rows="dynamic" lets you delete rows you don't want.
+        edited = st.data_editor(
+            rows, num_rows="dynamic", hide_index=True, use_container_width=True
+        )
+
+        # Default the meal dropdown to Claude's guess.
+        meals = ["breakfast", "lunch", "dinner", "snack"]
+        guess = result.get("meal_guess", "lunch")
+        meal_type = st.selectbox(
+            "Meal type", meals, index=meals.index(guess) if guess in meals else 1
+        )
+
+        if st.button("Add all to log", type="primary"):
+            # Convert the edited friendly rows back into the internal shape.
+            items = [
+                {
+                    "name": r["Food"],
+                    "estimated_grams": r["Grams"],
+                    "calories": r["Calories"],
+                    "protein_g": r["Protein (g)"],
+                    "carbs_g": r["Carbs (g)"],
+                    "fat_g": r["Fat (g)"],
+                }
+                for r in edited
+            ]
+            save_photo_items(items, meal_type)
+            st.success(f"Logged {len(items)} item(s) as {meal_type}.")
+            # Clear so the table disappears after saving.
+            del st.session_state["photo_result"]
+
+
+def _search_tab():
+    """The original typed USDA search flow — a backup for when you have no photo."""
     # st.text_input draws a search box. Whatever the user typed comes back here.
     query = st.text_input("Search for a food", placeholder="e.g. chicken breast")
 
@@ -271,7 +512,7 @@ def page_log_food():
 # PAGE 2: DASHBOARD
 # ----------------------------------------------------------------------
 def _progress_row(label, total, target, unit):
-    """Draw one metric: a number vs target plus a progress bar."""
+    """Draw one metric: a number vs a single target plus a progress bar."""
     if target:  # target is set (not None / not 0)
         pct = total / target
         st.write(
@@ -284,6 +525,39 @@ def _progress_row(label, total, target, unit):
         st.write(f"**{label}:** {total:.0f} {unit}  (no target set)")
 
 
+def _range_row(label, total, lo, hi, unit, kind):
+    """
+    Draw a metric against a min–max RANGE with a status word.
+    `kind` is "ceiling" (calories — stay under the top) or "floor"
+    (protein — get above the bottom).
+    """
+    if not hi:  # no range set — just show the total
+        st.write(f"**{label}:** {total:.0f} {unit}  (no target set)")
+        return
+
+    if kind == "ceiling":
+        if total > hi:
+            status = f"⚠️ {total - hi:.0f} over ceiling"
+        elif total >= (lo or 0):
+            status = "✅ in range"
+        else:
+            status = f"↓ {(lo or 0) - total:.0f} below floor"
+    else:  # "floor" — the goal is to reach at least `lo`
+        if total >= hi:
+            status = "✅ goal hit"
+        elif total >= (lo or 0):
+            status = "✅ floor met"
+        else:
+            status = f"↓ {(lo or 0) - total:.0f} to floor"
+
+    pct = total / hi
+    st.write(
+        f"**{label}:** {total:.0f} / {lo:.0f}–{hi:.0f} {unit}  "
+        f"({pct * 100:.0f}% of top)  {status}"
+    )
+    st.progress(min(pct, 1.0))
+
+
 def page_dashboard():
     st.header("📊 Dashboard")
     st.caption(f"Today: {date.today().isoformat()}")
@@ -291,8 +565,16 @@ def page_dashboard():
     totals = get_today_totals()
     targets = get_targets() or {}
 
-    _progress_row("Calories", totals["calories"], targets.get("calorie_target"), "kcal")
-    _progress_row("Protein", totals["protein_g"], targets.get("protein_target"), "g")
+    # Calories: a ceiling to stay under. Protein: a floor to reach.
+    _range_row(
+        "Calories", totals["calories"],
+        targets.get("calorie_min"), targets.get("calorie_max"), "kcal", "ceiling",
+    )
+    _range_row(
+        "Protein", totals["protein_g"],
+        targets.get("protein_min"), targets.get("protein_max"), "g", "floor",
+    )
+    # Carbs and fat have no target yet — these just show the running total.
     _progress_row("Carbs", totals["carbs_g"], targets.get("carb_target"), "g")
     _progress_row("Fat", totals["fat_g"], targets.get("fat_target"), "g")
 

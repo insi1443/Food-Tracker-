@@ -64,14 +64,19 @@ def main():
 
     # --- Table 3: targets -----------------------------------------------
     # Your daily goals. We keep just ONE row in this table.
+    # Calories and protein are stored as a RANGE (min + max) because you're
+    # cutting: calories have a ceiling to stay under, protein a floor to hit.
+    # Carbs and fat stay as a single optional target (empty for now).
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS targets (
-            id              INTEGER PRIMARY KEY,
-            calorie_target  REAL,
-            protein_target  REAL,
-            carb_target     REAL,
-            fat_target      REAL
+            id           INTEGER PRIMARY KEY,
+            calorie_min  REAL,
+            calorie_max  REAL,
+            protein_min  REAL,
+            protein_max  REAL,
+            carb_target  REAL,
+            fat_target   REAL
         )
         """
     )
@@ -82,12 +87,13 @@ def main():
     if cur.fetchone()[0] == 0:
         cur.execute(
             """
-            INSERT INTO targets (calorie_target, protein_target, carb_target, fat_target)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO targets
+                (calorie_min, calorie_max, protein_min, protein_max, carb_target, fat_target)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (2850, 130, None, None),  # carbs & fat left empty (NULL) for now
+            (1600, 2000, 120, 140, None, None),  # cutting targets; carbs/fat empty
         )
-        print("Inserted default targets: 2850 kcal, 130 g protein.")
+        print("Inserted cutting targets: 1600–2000 kcal, 120–140 g protein.")
 
     # conn.commit() saves your changes to disk. Without it, nothing is kept.
     conn.commit()
