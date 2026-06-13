@@ -46,9 +46,10 @@ USDA_API_KEY = get_secret("USDA_API_KEY", "DEMO_KEY")  # falls back to DEMO_KEY
 # The USDA FoodData Central search endpoint.
 USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 
-# The Claude model we use to look at photos. Opus 4.8 is Anthropic's most
-# capable model and supports vision (reading images).
-CLAUDE_MODEL = "claude-opus-4-8"
+# The Claude model used for photo/text/screenshot reading. Sonnet 4.6 is a
+# strong vision model at ~1/2 the cost of Opus — plenty for food estimation,
+# and it keeps good knowledge of local dishes for the Describe tab.
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 
 # ----------------------------------------------------------------------
