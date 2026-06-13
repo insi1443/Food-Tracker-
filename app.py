@@ -828,15 +828,33 @@ def _render_day_view(day_iso):
     _progress_row("Carbs", totals["carbs_g"], targets.get("carb_target"), "g")
     _progress_row("Fat", totals["fat_g"], targets.get("fat_target"), "g")
 
-    # Calories burned (steps + exercise) and the resulting net intake.
+    # Calories burned (steps + exercise), the resulting net intake, and — when we
+    # have a maintenance estimate from your profile — the day's calorie deficit.
     out_kcal, act = calories_out_for(day_iso)
+    food = totals["calories"]
     if out_kcal > 0:
-        net = totals["calories"] - out_kcal
         st.caption(
             f"Activity out: ~{out_kcal:.0f} kcal "
             f"({act['steps']:,} steps + {act['exercise_kcal']:.0f} exercise)  ·  "
-            f"**Net intake: {net:.0f} kcal**"
+            f"**Net intake: {food - out_kcal:.0f} kcal**"
         )
+
+    if targets.get("dynamic") and food > 0:
+        total_burn = targets["tdee"] + out_kcal           # maintenance + extra activity
+        deficit = total_burn - food                       # +ve = losing, -ve = surplus
+        fat_g = abs(deficit) / 7.7                         # ~7700 kcal per kg of fat
+        if deficit >= 0:
+            st.success(
+                f"**Deficit so far today: ~{deficit:.0f} kcal** (≈ {fat_g:.0f} g fat)\n\n"
+                f"Burn ≈ {total_burn:.0f} (maintenance {targets['tdee']:.0f} + "
+                f"activity {out_kcal:.0f}) − food {food:.0f}."
+            )
+        else:
+            st.warning(
+                f"**Surplus so far today: +{-deficit:.0f} kcal** over maintenance "
+                f"(≈ {fat_g:.0f} g fat). Burn ≈ {total_burn:.0f} − food {food:.0f}."
+            )
+        st.caption("Running estimate — most accurate once the day's food is fully logged.")
 
     # A list of everything logged that day, each with a delete button.
     st.subheader("Entries")
