@@ -13,18 +13,32 @@ Then open the URL it prints (usually http://localhost:8501).
 import base64
 import json
 import os
-import sqlite3
 from datetime import date, timedelta
 
 import anthropic         # the Claude SDK — analyses food photos
 import requests          # for calling the USDA web API
 import streamlit as st   # the web-app framework
 from dotenv import load_dotenv  # reads your API keys out of the .env file
+from sqlalchemy import text  # lets us run SQL through the shared engine
+
+from db import engine, ensure_db  # the database connection (SQLite or Postgres)
 
 # Load variables from the .env file into the environment so we can read them.
 load_dotenv()
-USDA_API_KEY = os.getenv("USDA_API_KEY", "DEMO_KEY")  # falls back to DEMO_KEY
-DB_NAME = "foodtracker.db"
+
+
+def get_secret(name, default=None):
+    """Read a secret from Streamlit's Secrets box (when deployed) or from the
+    environment / .env file (when running on your Mac). Keeps keys out of code."""
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+USDA_API_KEY = get_secret("USDA_API_KEY", "DEMO_KEY")  # falls back to DEMO_KEY
 
 # The USDA FoodData Central search endpoint.
 USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
@@ -38,23 +52,13 @@ CLAUDE_MODEL = "claude-opus-4-8"
 # DATABASE HELPERS
 # Small functions so the page code below stays readable.
 # ----------------------------------------------------------------------
-def get_connection():
-    """Open a connection to the SQLite file."""
-    return sqlite3.connect(DB_NAME)
-
-
 def get_targets():
     """Return the single targets row as a dict (or None if missing)."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT calorie_min, calorie_max, protein_min, protein_max, carb_target, fat_target
-        FROM targets LIMIT 1
-        """
-    )
-    row = cur.fetchone()
-    conn.close()
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT calorie_min, calorie_max, protein_min, protein_max, carb_target, fat_target
+            FROM targets LIMIT 1
+        """)).fetchone()
     if row is None:
         return None
     return {
@@ -68,24 +72,18 @@ def get_targets():
 
 
 def get_totals_for(day_iso):
-    """Sum up calories/macros for everything logged on one day (e.g. '2026-06-13')."""
-    conn = get_connection()
-    cur = conn.cursor()
-    # COALESCE(..., 0) turns a NULL sum (no rows yet) into 0.
-    cur.execute(
-        """
-        SELECT
-            COALESCE(SUM(calories), 0),
-            COALESCE(SUM(protein_g), 0),
-            COALESCE(SUM(carbs_g), 0),
-            COALESCE(SUM(fat_g), 0)
-        FROM logs
-        WHERE date = ?
-        """,
-        (day_iso,),
-    )
-    row = cur.fetchone()
-    conn.close()
+    """Sum up calories/macros for everything logged on one day (e.g. '2026-06-13').
+    COALESCE(..., 0) turns a NULL sum (no rows yet) into 0."""
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT
+                COALESCE(SUM(calories), 0),
+                COALESCE(SUM(protein_g), 0),
+                COALESCE(SUM(carbs_g), 0),
+                COALESCE(SUM(fat_g), 0)
+            FROM logs
+            WHERE date = :day
+        """), {"day": day_iso}).fetchone()
     return {
         "calories": row[0],
         "protein_g": row[1],
@@ -104,24 +102,18 @@ def get_totals_in_range(start_iso, end_iso):
     Return a dict {date_string: totals_dict} for every day in [start, end]
     that has at least one logged entry. Days with nothing logged are omitted.
     """
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT
-            date,
-            COALESCE(SUM(calories), 0),
-            COALESCE(SUM(protein_g), 0),
-            COALESCE(SUM(carbs_g), 0),
-            COALESCE(SUM(fat_g), 0)
-        FROM logs
-        WHERE date BETWEEN ? AND ?
-        GROUP BY date
-        """,
-        (start_iso, end_iso),
-    )
-    rows = cur.fetchall()
-    conn.close()
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT
+                date,
+                COALESCE(SUM(calories), 0),
+                COALESCE(SUM(protein_g), 0),
+                COALESCE(SUM(carbs_g), 0),
+                COALESCE(SUM(fat_g), 0)
+            FROM logs
+            WHERE date BETWEEN :start AND :end
+            GROUP BY date
+        """), {"start": start_iso, "end": end_iso}).fetchall()
     return {
         r[0]: {"calories": r[1], "protein_g": r[2], "carbs_g": r[3], "fat_g": r[4]}
         for r in rows
@@ -131,20 +123,15 @@ def get_totals_in_range(start_iso, end_iso):
 def get_logs_for(day_iso):
     """Return one day's individual log rows, newest first.
     The first column is the row `id`, which we need in order to delete it."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, meal_type, food_name, quantity_g, calories, protein_g, carbs_g, fat_g
-        FROM logs
-        WHERE date = ?
-        ORDER BY id DESC
-        """,
-        (day_iso,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT id, meal_type, food_name, quantity_g, calories, protein_g, carbs_g, fat_g
+            FROM logs
+            WHERE date = :day
+            ORDER BY id DESC
+        """), {"day": day_iso}).fetchall()
+    # Return plain tuples so the page code can unpack them simply.
+    return [tuple(r) for r in rows]
 
 
 def get_today_logs():
@@ -154,11 +141,8 @@ def get_today_logs():
 
 def delete_log(log_id):
     """Delete a single log entry by its row id."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM logs WHERE id = ?", (log_id,))
-    conn.commit()
-    conn.close()
+    with engine.begin() as conn:  # begin() = run inside a transaction and commit
+        conn.execute(text("DELETE FROM logs WHERE id = :id"), {"id": log_id})
 
 
 def save_food_and_log(food, quantity_g, meal_type):
@@ -167,58 +151,44 @@ def save_food_and_log(food, quantity_g, meal_type):
     `logs` with the macros scaled to the quantity actually eaten.
     `food` is a dict we build from the USDA result.
     """
-    conn = get_connection()
-    cur = conn.cursor()
+    with engine.begin() as conn:
+        # Reuse an existing foods row if we already stored this exact food+source.
+        existing = conn.execute(
+            text("SELECT id FROM foods WHERE name = :n AND source = :s"),
+            {"n": food["name"], "s": food["source"]},
+        ).fetchone()
+        if existing:
+            food_id = existing[0]
+        else:
+            # RETURNING id hands back the new row's id (works on SQLite & Postgres).
+            food_id = conn.execute(text("""
+                INSERT INTO foods (name, calories_per_100g, protein_g, carbs_g, fat_g, source)
+                VALUES (:n, :cal, :p, :c, :f, :s)
+                RETURNING id
+            """), {
+                "n": food["name"], "cal": food["calories_per_100g"],
+                "p": food["protein_g"], "c": food["carbs_g"],
+                "f": food["fat_g"], "s": food["source"],
+            }).scalar()
 
-    # Reuse an existing foods row if we already stored this exact food+source,
-    # otherwise insert a new one. This keeps the foods table tidy.
-    cur.execute(
-        "SELECT id FROM foods WHERE name = ? AND source = ?",
-        (food["name"], food["source"]),
-    )
-    existing = cur.fetchone()
-    if existing:
-        food_id = existing[0]
-    else:
-        cur.execute(
-            """
-            INSERT INTO foods (name, calories_per_100g, protein_g, carbs_g, fat_g, source)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                food["name"],
-                food["calories_per_100g"],
-                food["protein_g"],
-                food["carbs_g"],
-                food["fat_g"],
-                food["source"],
-            ),
-        )
-        food_id = cur.lastrowid
-
-    # Scale per-100g values to the amount eaten. factor = grams / 100.
-    factor = quantity_g / 100.0
-    cur.execute(
-        """
-        INSERT INTO logs
-            (date, food_id, food_name, quantity_g, meal_type,
-             calories, protein_g, carbs_g, fat_g)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            date.today().isoformat(),
-            food_id,
-            food["name"],
-            quantity_g,
-            meal_type,
-            round(food["calories_per_100g"] * factor, 1),
-            round(food["protein_g"] * factor, 1),
-            round(food["carbs_g"] * factor, 1),
-            round(food["fat_g"] * factor, 1),
-        ),
-    )
-    conn.commit()
-    conn.close()
+        # Scale per-100g values to the amount eaten. factor = grams / 100.
+        factor = quantity_g / 100.0
+        conn.execute(text("""
+            INSERT INTO logs
+                (date, food_id, food_name, quantity_g, meal_type,
+                 calories, protein_g, carbs_g, fat_g)
+            VALUES (:date, :fid, :name, :qty, :meal, :cal, :p, :c, :f)
+        """), {
+            "date": date.today().isoformat(),
+            "fid": food_id,
+            "name": food["name"],
+            "qty": quantity_g,
+            "meal": meal_type,
+            "cal": round(food["calories_per_100g"] * factor, 1),
+            "p": round(food["protein_g"] * factor, 1),
+            "c": round(food["carbs_g"] * factor, 1),
+            "f": round(food["fat_g"] * factor, 1),
+        })
 
 
 # ----------------------------------------------------------------------
@@ -324,9 +294,9 @@ def analyze_food_photo(image_bytes, media_type):
          "meal_guess": "lunch"}
     `media_type` is something like "image/jpeg" or "image/png".
     """
-    # anthropic.Anthropic() automatically reads ANTHROPIC_API_KEY from the
-    # environment (which load_dotenv put there from your .env file).
-    client = anthropic.Anthropic()
+    # Pass the key explicitly so it works both locally (.env) and on Streamlit
+    # Cloud (Secrets box) — get_secret checks both places.
+    client = anthropic.Anthropic(api_key=get_secret("ANTHROPIC_API_KEY"))
 
     # Images are sent as base64 text — a way of writing binary data as letters.
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
@@ -365,56 +335,44 @@ def save_photo_items(items, meal_type):
     Unlike the USDA path, Claude already gives us the totals for the actual
     portion eaten, so we store those numbers directly (no per-100g scaling).
     """
-    conn = get_connection()
-    cur = conn.cursor()
     today = date.today().isoformat()
+    with engine.begin() as conn:
+        for it in items:
+            grams = it["estimated_grams"] or 0
 
-    for it in items:
-        grams = it["estimated_grams"] or 0
+            # We also keep a per-100g row in `foods` so the foods table stays
+            # consistent with the USDA entries. Guard against divide-by-zero.
+            def per_100g(value):
+                return round(value / grams * 100, 1) if grams else 0
 
-        # We also keep a per-100g row in `foods` so the foods table stays
-        # consistent with the USDA entries. Guard against divide-by-zero.
-        def per_100g(value):
-            return round(value / grams * 100, 1) if grams else 0
+            food_id = conn.execute(text("""
+                INSERT INTO foods (name, calories_per_100g, protein_g, carbs_g, fat_g, source)
+                VALUES (:n, :cal, :p, :c, :f, 'AI photo')
+                RETURNING id
+            """), {
+                "n": it["name"],
+                "cal": per_100g(it["calories"]),
+                "p": per_100g(it["protein_g"]),
+                "c": per_100g(it["carbs_g"]),
+                "f": per_100g(it["fat_g"]),
+            }).scalar()
 
-        cur.execute(
-            """
-            INSERT INTO foods (name, calories_per_100g, protein_g, carbs_g, fat_g, source)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                it["name"],
-                per_100g(it["calories"]),
-                per_100g(it["protein_g"]),
-                per_100g(it["carbs_g"]),
-                per_100g(it["fat_g"]),
-                "AI photo",
-            ),
-        )
-        food_id = cur.lastrowid
-
-        cur.execute(
-            """
-            INSERT INTO logs
-                (date, food_id, food_name, quantity_g, meal_type,
-                 calories, protein_g, carbs_g, fat_g)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                today,
-                food_id,
-                it["name"],
-                grams,
-                meal_type,
-                round(it["calories"], 1),
-                round(it["protein_g"], 1),
-                round(it["carbs_g"], 1),
-                round(it["fat_g"], 1),
-            ),
-        )
-
-    conn.commit()
-    conn.close()
+            conn.execute(text("""
+                INSERT INTO logs
+                    (date, food_id, food_name, quantity_g, meal_type,
+                     calories, protein_g, carbs_g, fat_g)
+                VALUES (:date, :fid, :name, :qty, :meal, :cal, :p, :c, :f)
+            """), {
+                "date": today,
+                "fid": food_id,
+                "name": it["name"],
+                "qty": grams,
+                "meal": meal_type,
+                "cal": round(it["calories"], 1),
+                "p": round(it["protein_g"], 1),
+                "c": round(it["carbs_g"], 1),
+                "f": round(it["fat_g"], 1),
+            })
 
 
 # ----------------------------------------------------------------------
@@ -738,6 +696,9 @@ def page_weekly():
 def main():
     st.set_page_config(page_title="Calorie & Macro Tracker", page_icon="🥗")
     st.title("🥗 Calorie & Macro Tracker")
+
+    # Make sure the tables exist (creates them on first run in the cloud).
+    ensure_db()
 
     page = st.sidebar.radio(
         "Go to", ["Log Food", "Dashboard", "Calendar", "Weekly summary"]

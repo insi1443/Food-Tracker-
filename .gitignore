@@ -1,5 +1,6 @@
-# Secrets — never commit your API key
+# Secrets — never commit your API keys
 .env
+.streamlit/secrets.toml
 
 # Database file — your personal data stays local
 foodtracker.db
