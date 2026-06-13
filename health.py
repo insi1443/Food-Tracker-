@@ -60,6 +60,23 @@ def protein_targets(weight_kg, body_fat_pct):
     return round(weight_kg * PROTEIN_PER_KG_BW), round(weight_kg * (PROTEIN_PER_KG_BW + 0.3))
 
 
+# Fat target as grams per kg of body weight. ~0.8 g/kg lands around 25–30% of
+# calories — a sensible floor on a cut to protect hormones.
+FAT_PER_KG = 0.8
+
+
+def fat_target_g(weight_kg, per_kg=FAT_PER_KG):
+    """Daily fat target in grams, anchored to body weight."""
+    return round((weight_kg or 70) * per_kg)
+
+
+def carb_target_g(calorie_budget, protein_g, fat_g):
+    """Carbs fill whatever calories remain after protein and fat are accounted
+    for. Protein & carbs are 4 kcal/g, fat is 9 kcal/g."""
+    remaining = calorie_budget - (protein_g * 4) - (fat_g * 9)
+    return max(round(remaining / 4), 0)
+
+
 def steps_to_kcal(steps, weight_kg):
     """Rough calories burned from walking `steps`, scaled to body weight."""
     if not steps:

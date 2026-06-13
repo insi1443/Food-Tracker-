@@ -306,10 +306,13 @@ def get_active_targets():
         deficit = profile.get("deficit_kcal") or 500
         cmin, cmax = health.calorie_targets(maintenance, deficit)
         pmin, pmax = health.protein_targets(weight, body_fat)
+        # Fat anchored to body weight; carbs fill the calories left at the ceiling.
+        fat = health.fat_target_g(weight)
+        carbs = health.carb_target_g(cmax, pmax, fat)
         return {
             "calorie_min": cmin, "calorie_max": cmax,
             "protein_min": pmin, "protein_max": pmax,
-            "carb_target": None, "fat_target": None,
+            "carb_target": carbs, "fat_target": fat,
             "dynamic": True, "tdee": maintenance, "deficit": deficit,
             "weight": weight, "body_fat_pct": body_fat,
         }
