@@ -16,11 +16,13 @@ import os
 from datetime import date, timedelta
 
 import anthropic         # the Claude SDK — analyses food photos
+import pandas as pd      # used for the weight trend chart
 import requests          # for calling the USDA web API
 import streamlit as st   # the web-app framework
 from dotenv import load_dotenv  # reads your API keys out of the .env file
 from sqlalchemy import text  # lets us run SQL through the shared engine
 
+import health            # calorie / protein / projection maths
 from db import engine, ensure_db  # the database connection (SQLite or Postgres)
 
 # Load variables from the .env file into the environment so we can read them.
@@ -189,6 +191,140 @@ def save_food_and_log(food, quantity_g, meal_type):
             "c": round(food["carbs_g"] * factor, 1),
             "f": round(food["fat_g"] * factor, 1),
         })
+
+
+# ----------------------------------------------------------------------
+# PROFILE / WEIGHT / ACTIVITY  (the body-composition side)
+# ----------------------------------------------------------------------
+def get_profile():
+    """Return the single profile row as a dict (or None if not set up yet)."""
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT height_cm, age, sex, activity_factor, goal_weight_kg,
+                   goal_bodyfat_pct, trip_date, deficit_kcal
+            FROM profile LIMIT 1
+        """)).fetchone()
+    if row is None:
+        return None
+    keys = ["height_cm", "age", "sex", "activity_factor", "goal_weight_kg",
+            "goal_bodyfat_pct", "trip_date", "deficit_kcal"]
+    return dict(zip(keys, row))
+
+
+def save_profile(p):
+    """Insert or update the single profile row."""
+    with engine.begin() as conn:
+        existing = conn.execute(text("SELECT id FROM profile LIMIT 1")).fetchone()
+        if existing:
+            conn.execute(text("""
+                UPDATE profile SET
+                    height_cm = :height_cm, age = :age, sex = :sex,
+                    activity_factor = :activity_factor, goal_weight_kg = :goal_weight_kg,
+                    goal_bodyfat_pct = :goal_bodyfat_pct, trip_date = :trip_date,
+                    deficit_kcal = :deficit_kcal
+                WHERE id = :id
+            """), {**p, "id": existing[0]})
+        else:
+            conn.execute(text("""
+                INSERT INTO profile
+                    (height_cm, age, sex, activity_factor, goal_weight_kg,
+                     goal_bodyfat_pct, trip_date, deficit_kcal)
+                VALUES (:height_cm, :age, :sex, :activity_factor, :goal_weight_kg,
+                        :goal_bodyfat_pct, :trip_date, :deficit_kcal)
+            """), p)
+
+
+def add_weight(date_iso, weight_kg, body_fat_pct):
+    """Record a weigh-in."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO weight_log (date, weight_kg, body_fat_pct)
+            VALUES (:d, :w, :b)
+        """), {"d": date_iso, "w": weight_kg, "b": body_fat_pct})
+
+
+def get_weights():
+    """All weigh-ins, oldest first, as (date, weight_kg, body_fat_pct) tuples."""
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT date, weight_kg, body_fat_pct FROM weight_log ORDER BY date, id
+        """)).fetchall()
+    return [tuple(r) for r in rows]
+
+
+def get_latest_weight():
+    """Most recent (weight_kg, body_fat_pct, date), or (None, None, None)."""
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT weight_kg, body_fat_pct, date FROM weight_log
+            ORDER BY date DESC, id DESC LIMIT 1
+        """)).fetchone()
+    return tuple(row) if row else (None, None, None)
+
+
+def save_activity(date_iso, steps, exercise_kcal, note):
+    """Insert or update one day's steps + exercise."""
+    with engine.begin() as conn:
+        existing = conn.execute(
+            text("SELECT id FROM activity_log WHERE date = :d"), {"d": date_iso}
+        ).fetchone()
+        if existing:
+            conn.execute(text("""
+                UPDATE activity_log SET steps = :s, exercise_kcal = :e, note = :n
+                WHERE id = :id
+            """), {"s": steps, "e": exercise_kcal, "n": note, "id": existing[0]})
+        else:
+            conn.execute(text("""
+                INSERT INTO activity_log (date, steps, exercise_kcal, note)
+                VALUES (:d, :s, :e, :n)
+            """), {"d": date_iso, "s": steps, "e": exercise_kcal, "n": note})
+
+
+def get_activity_for(date_iso):
+    """One day's activity as a dict (zeros if nothing logged)."""
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT steps, exercise_kcal, note FROM activity_log WHERE date = :d
+        """), {"d": date_iso}).fetchone()
+    if row is None:
+        return {"steps": 0, "exercise_kcal": 0, "note": ""}
+    return {"steps": row[0] or 0, "exercise_kcal": row[1] or 0, "note": row[2] or ""}
+
+
+def get_active_targets():
+    """The targets the dashboard should use. If you've filled in your profile AND
+    logged at least one weight, these are computed dynamically from your latest
+    weight (so they drift as you do). Otherwise we fall back to the fixed targets
+    in the `targets` table."""
+    profile = get_profile()
+    weight, body_fat, _ = get_latest_weight()
+    if profile and profile.get("height_cm") and weight:
+        maintenance = health.tdee(
+            weight, profile["height_cm"], profile["age"],
+            profile["sex"], profile["activity_factor"],
+        )
+        deficit = profile.get("deficit_kcal") or 500
+        cmin, cmax = health.calorie_targets(maintenance, deficit)
+        pmin, pmax = health.protein_targets(weight, body_fat)
+        return {
+            "calorie_min": cmin, "calorie_max": cmax,
+            "protein_min": pmin, "protein_max": pmax,
+            "carb_target": None, "fat_target": None,
+            "dynamic": True, "tdee": maintenance, "deficit": deficit,
+            "weight": weight, "body_fat_pct": body_fat,
+        }
+    # Fallback: the fixed targets row.
+    t = get_targets() or {}
+    t["dynamic"] = False
+    return t
+
+
+def calories_out_for(day_iso):
+    """Estimated calories burned through steps + logged exercise on a day."""
+    act = get_activity_for(day_iso)
+    weight, _, _ = get_latest_weight()
+    step_kcal = health.steps_to_kcal(act["steps"], weight)
+    return step_kcal + (act["exercise_kcal"] or 0), act
 
 
 # ----------------------------------------------------------------------
@@ -567,7 +703,7 @@ def _render_day_view(day_iso):
     """Show one day's totals (vs targets) and its entries with delete buttons.
     Shared by the Dashboard (today) and the Calendar (any day)."""
     totals = get_totals_for(day_iso)
-    targets = get_targets() or {}
+    targets = get_active_targets()
 
     # Calories: a ceiling to stay under. Protein: a floor to reach.
     _range_row(
@@ -581,6 +717,16 @@ def _render_day_view(day_iso):
     # Carbs and fat have no target yet — these just show the running total.
     _progress_row("Carbs", totals["carbs_g"], targets.get("carb_target"), "g")
     _progress_row("Fat", totals["fat_g"], targets.get("fat_target"), "g")
+
+    # Calories burned (steps + exercise) and the resulting net intake.
+    out_kcal, act = calories_out_for(day_iso)
+    if out_kcal > 0:
+        net = totals["calories"] - out_kcal
+        st.caption(
+            f"Activity out: ~{out_kcal:.0f} kcal "
+            f"({act['steps']:,} steps + {act['exercise_kcal']:.0f} exercise)  ·  "
+            f"**Net intake: {net:.0f} kcal**"
+        )
 
     # A list of everything logged that day, each with a delete button.
     st.subheader("Entries")
@@ -604,10 +750,179 @@ def _render_day_view(day_iso):
         st.info("Nothing logged on this day.")
 
 
+def _trip_panel():
+    """Days until the trip + a straight-line weight projection at your current rate."""
+    profile = get_profile()
+    if not profile or not profile.get("trip_date"):
+        return
+    trip = date.fromisoformat(profile["trip_date"])
+    days = (trip - date.today()).days
+    if days < 0:
+        return
+
+    st.subheader("🏖️ Trip countdown")
+    st.write(f"**{days} days** until {trip.strftime('%d %b %Y')}.")
+
+    weights = get_weights()
+    if len(weights) >= 2:
+        d0, w0 = date.fromisoformat(weights[0][0]), weights[0][1]
+        d1, w1 = date.fromisoformat(weights[-1][0]), weights[-1][1]
+        span = (d1 - d0).days
+        if span > 0 and w0 and w1:
+            kg_per_week = (w1 - w0) / span * 7
+            proj = health.project_weight(w1, kg_per_week, days)
+            st.write(
+                f"At your current trend (**{kg_per_week:+.2f} kg/week**), "
+                f"projected ~**{proj:.1f} kg** by your trip."
+            )
+            if profile.get("goal_weight_kg"):
+                st.write(f"Goal: {profile['goal_weight_kg']:.1f} kg.")
+    else:
+        st.caption("Log at least two weigh-ins to see a projection.")
+
+
 def page_dashboard():
     st.header("📊 Dashboard")
     st.caption(f"Today: {date.today().isoformat()}")
+
+    targets = get_active_targets()
+    if targets.get("dynamic"):
+        st.caption(
+            f"🎯 Targets auto-set from your latest weight "
+            f"**{targets['weight']:.1f} kg** — est. maintenance "
+            f"{targets['tdee']:.0f} kcal − {targets['deficit']:.0f} deficit."
+        )
+    else:
+        st.caption(
+            "🎯 Using fixed targets. Fill in **Profile** and log a weight under "
+            "**Body & Activity** to switch to auto-adjusting targets."
+        )
+
     _render_day_view(date.today().isoformat())
+    _trip_panel()
+
+
+# ----------------------------------------------------------------------
+# PAGE: PROFILE & GOALS
+# ----------------------------------------------------------------------
+def page_profile():
+    st.header("⚙️ Profile & goals")
+    st.caption("These drive your auto-adjusting calorie & protein targets.")
+    p = get_profile() or {}
+
+    col1, col2 = st.columns(2)
+    with col1:
+        height = st.number_input(
+            "Height (cm)", 100.0, 230.0, value=float(p.get("height_cm") or 170.0), step=0.5
+        )
+        age = st.number_input("Age", 12, 100, value=int(p.get("age") or 25))
+        sexes = ["male", "female"]
+        sex = st.selectbox(
+            "Sex (for the calorie formula)", sexes,
+            index=sexes.index(p["sex"]) if p.get("sex") in sexes else 0,
+        )
+    with col2:
+        labels = list(health.ACTIVITY_FACTORS.keys())
+        cur_factor = p.get("activity_factor") or health.ACTIVITY_FACTORS[labels[1]]
+        cur_label = next(
+            (l for l, f in health.ACTIVITY_FACTORS.items() if abs(f - cur_factor) < 1e-6),
+            labels[1],
+        )
+        activity_label = st.selectbox(
+            "Daily activity (not counting logged workouts)",
+            labels, index=labels.index(cur_label),
+        )
+        deficit = st.number_input(
+            "Daily calorie deficit", 0, 1200,
+            value=int(p.get("deficit_kcal") or 500), step=50,
+        )
+        st.caption("~500/day ≈ 0.5 kg/week. Higher = faster, but harder to keep muscle.")
+
+    st.divider()
+    col3, col4, col5 = st.columns(3)
+    with col3:
+        goal_w = st.number_input(
+            "Goal weight (kg, optional)", 0.0, 200.0,
+            value=float(p.get("goal_weight_kg") or 0.0), step=0.5,
+        )
+    with col4:
+        goal_bf = st.number_input(
+            "Goal body fat % (optional)", 0.0, 60.0,
+            value=float(p.get("goal_bodyfat_pct") or 0.0), step=0.5,
+        )
+    with col5:
+        trip = st.date_input(
+            "Trip date",
+            value=date.fromisoformat(p["trip_date"]) if p.get("trip_date") else date.today(),
+        )
+
+    if st.button("Save profile", type="primary"):
+        save_profile({
+            "height_cm": height,
+            "age": int(age),
+            "sex": sex,
+            "activity_factor": health.ACTIVITY_FACTORS[activity_label],
+            "goal_weight_kg": goal_w or None,
+            "goal_bodyfat_pct": goal_bf or None,
+            "trip_date": trip.isoformat(),
+            "deficit_kcal": deficit,
+        })
+        st.success("Profile saved. Your targets will now adjust to your weight.")
+
+
+# ----------------------------------------------------------------------
+# PAGE: BODY & ACTIVITY
+# ----------------------------------------------------------------------
+def page_body():
+    st.header("⚖️ Body & activity")
+    weigh_tab, activity_tab = st.tabs(["Weigh-in", "Steps & exercise"])
+
+    with weigh_tab:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            wdate = st.date_input("Date", value=date.today(), key="weigh_date")
+        with col2:
+            weight = st.number_input("Weight (kg)", 30.0, 250.0, value=70.0, step=0.1)
+        with col3:
+            bf = st.number_input("Body fat % (optional)", 0.0, 60.0, value=0.0, step=0.1)
+        if st.button("Add weigh-in", type="primary"):
+            add_weight(wdate.isoformat(), weight, bf or None)
+            st.success(f"Logged {weight:.1f} kg on {wdate.isoformat()}.")
+
+        weights = get_weights()
+        if weights:
+            df = pd.DataFrame(weights, columns=["date", "weight_kg", "body_fat_pct"])
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date")
+            st.subheader("Weight trend")
+            st.line_chart(df["weight_kg"])
+            if df["body_fat_pct"].notna().any():
+                st.subheader("Body fat % trend")
+                st.line_chart(df["body_fat_pct"])
+
+    with activity_tab:
+        adate = st.date_input("Date", value=date.today(), key="act_date")
+        current = get_activity_for(adate.isoformat())
+        steps = st.number_input(
+            "Steps", 0, 100000, value=int(current["steps"]), step=500
+        )
+        ex_kcal = st.number_input(
+            "Exercise calories burned", 0, 5000,
+            value=int(current["exercise_kcal"]), step=50,
+            help="From your watch/app, or your best estimate.",
+        )
+        note = st.text_input("Workout note (optional)", value=current["note"])
+        if st.button("Save activity", type="primary"):
+            save_activity(adate.isoformat(), steps, ex_kcal, note)
+            st.success(f"Saved activity for {adate.isoformat()}.")
+
+        # Show today's estimated burn from steps for context.
+        weight, _, _ = get_latest_weight()
+        if steps:
+            st.caption(
+                f"~{health.steps_to_kcal(steps, weight):.0f} kcal estimated from "
+                f"{steps:,} steps."
+            )
 
 
 # ----------------------------------------------------------------------
@@ -701,16 +1016,22 @@ def main():
     ensure_db()
 
     page = st.sidebar.radio(
-        "Go to", ["Log Food", "Dashboard", "Calendar", "Weekly summary"]
+        "Go to",
+        ["Log Food", "Dashboard", "Body & Activity", "Calendar",
+         "Weekly summary", "Profile"],
     )
     if page == "Log Food":
         page_log_food()
     elif page == "Dashboard":
         page_dashboard()
+    elif page == "Body & Activity":
+        page_body()
     elif page == "Calendar":
         page_calendar()
-    else:
+    elif page == "Weekly summary":
         page_weekly()
+    else:
+        page_profile()
 
 
 if __name__ == "__main__":

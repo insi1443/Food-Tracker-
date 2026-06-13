@@ -95,6 +95,39 @@ def ensure_db():
                 fat_target  REAL
             )
         """))
+        # Your body stats + goals (one row), used to compute dynamic targets.
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS profile (
+                {pk},
+                height_cm       REAL,
+                age             INTEGER,
+                sex             TEXT,
+                activity_factor REAL,
+                goal_weight_kg  REAL,
+                goal_bodyfat_pct REAL,
+                trip_date       TEXT,
+                deficit_kcal    REAL
+            )
+        """))
+        # Every weigh-in.
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS weight_log (
+                {pk},
+                date         TEXT NOT NULL,
+                weight_kg    REAL,
+                body_fat_pct REAL
+            )
+        """))
+        # Daily steps + exercise (one row per day).
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS activity_log (
+                {pk},
+                date          TEXT NOT NULL UNIQUE,
+                steps         INTEGER,
+                exercise_kcal REAL,
+                note          TEXT
+            )
+        """))
         # Seed your cutting targets, but only if the table is empty.
         count = conn.execute(text("SELECT COUNT(*) FROM targets")).scalar()
         if count == 0:
