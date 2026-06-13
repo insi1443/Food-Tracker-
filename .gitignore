@@ -1,0 +1,14 @@
+# Secrets — never commit your API key
+.env
+
+# Database file — your personal data stays local
+foodtracker.db
+
+# Python junk
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS junk
+.DS_Store
