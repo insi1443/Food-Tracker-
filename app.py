@@ -14,7 +14,7 @@ import base64
 import json
 import os
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 
 import anthropic         # the Claude SDK — analyses food photos
 import requests          # for calling the USDA web API
@@ -67,9 +67,8 @@ def get_targets():
     }
 
 
-def get_today_totals():
-    """Sum up calories/macros for everything logged today."""
-    today = date.today().isoformat()  # e.g. "2026-06-13"
+def get_totals_for(day_iso):
+    """Sum up calories/macros for everything logged on one day (e.g. '2026-06-13')."""
     conn = get_connection()
     cur = conn.cursor()
     # COALESCE(..., 0) turns a NULL sum (no rows yet) into 0.
@@ -83,7 +82,7 @@ def get_today_totals():
         FROM logs
         WHERE date = ?
         """,
-        (today,),
+        (day_iso,),
     )
     row = cur.fetchone()
     conn.close()
@@ -95,10 +94,43 @@ def get_today_totals():
     }
 
 
-def get_today_logs():
-    """Return today's individual log rows, newest first.
+def get_today_totals():
+    """Convenience wrapper: today's totals."""
+    return get_totals_for(date.today().isoformat())
+
+
+def get_totals_in_range(start_iso, end_iso):
+    """
+    Return a dict {date_string: totals_dict} for every day in [start, end]
+    that has at least one logged entry. Days with nothing logged are omitted.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            date,
+            COALESCE(SUM(calories), 0),
+            COALESCE(SUM(protein_g), 0),
+            COALESCE(SUM(carbs_g), 0),
+            COALESCE(SUM(fat_g), 0)
+        FROM logs
+        WHERE date BETWEEN ? AND ?
+        GROUP BY date
+        """,
+        (start_iso, end_iso),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return {
+        r[0]: {"calories": r[1], "protein_g": r[2], "carbs_g": r[3], "fat_g": r[4]}
+        for r in rows
+    }
+
+
+def get_logs_for(day_iso):
+    """Return one day's individual log rows, newest first.
     The first column is the row `id`, which we need in order to delete it."""
-    today = date.today().isoformat()
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -108,11 +140,16 @@ def get_today_logs():
         WHERE date = ?
         ORDER BY id DESC
         """,
-        (today,),
+        (day_iso,),
     )
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def get_today_logs():
+    """Convenience wrapper: today's log rows."""
+    return get_logs_for(date.today().isoformat())
 
 
 def delete_log(log_id):
@@ -568,11 +605,10 @@ def _range_row(label, total, lo, hi, unit, kind):
     st.progress(min(pct, 1.0))
 
 
-def page_dashboard():
-    st.header("📊 Dashboard")
-    st.caption(f"Today: {date.today().isoformat()}")
-
-    totals = get_today_totals()
+def _render_day_view(day_iso):
+    """Show one day's totals (vs targets) and its entries with delete buttons.
+    Shared by the Dashboard (today) and the Calendar (any day)."""
+    totals = get_totals_for(day_iso)
     targets = get_targets() or {}
 
     # Calories: a ceiling to stay under. Protein: a floor to reach.
@@ -588,9 +624,9 @@ def page_dashboard():
     _progress_row("Carbs", totals["carbs_g"], targets.get("carb_target"), "g")
     _progress_row("Fat", totals["fat_g"], targets.get("fat_target"), "g")
 
-    # A list of everything logged today, each with a delete button.
-    st.subheader("Today's entries")
-    logs = get_today_logs()
+    # A list of everything logged that day, each with a delete button.
+    st.subheader("Entries")
+    logs = get_logs_for(day_iso)
     if logs:
         for row in logs:
             log_id, meal, food, qty, cal, prot, carb, fat = row
@@ -607,7 +643,93 @@ def page_dashboard():
                     delete_log(log_id)
                     st.rerun()  # reload the page so totals + list update
     else:
-        st.info("Nothing logged yet today. Head to 'Log Food' to add something.")
+        st.info("Nothing logged on this day.")
+
+
+def page_dashboard():
+    st.header("📊 Dashboard")
+    st.caption(f"Today: {date.today().isoformat()}")
+    _render_day_view(date.today().isoformat())
+
+
+# ----------------------------------------------------------------------
+# PAGE 3: CALENDAR  (view any day)
+# ----------------------------------------------------------------------
+def page_calendar():
+    st.header("🗓️ Calendar")
+    # st.date_input pops up a real calendar to pick any day.
+    chosen = st.date_input("Pick a day to view", value=date.today())
+    st.caption(f"Showing {chosen.strftime('%A, %d %b %Y')}")
+    _render_day_view(chosen.isoformat())
+
+
+# ----------------------------------------------------------------------
+# PAGE 4: WEEKLY SUMMARY  (totals across a Mon–Sun week)
+# ----------------------------------------------------------------------
+def page_weekly():
+    st.header("📈 Weekly summary")
+
+    # Pick any day; we show the Monday–Sunday week that contains it.
+    anchor = st.date_input("Pick any day in the week", value=date.today())
+    monday = anchor - timedelta(days=anchor.weekday())  # weekday(): Mon=0
+    sunday = monday + timedelta(days=6)
+    st.caption(f"Week of {monday.strftime('%d %b')} – {sunday.strftime('%d %b %Y')}")
+
+    # One query pulls every logged day in the week.
+    per_day = get_totals_in_range(monday.isoformat(), sunday.isoformat())
+
+    # Build a 7-row table (Mon–Sun) and accumulate the weekly totals.
+    table = []
+    week_total = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0}
+    days_logged = 0
+    for i in range(7):
+        d = monday + timedelta(days=i)
+        t = per_day.get(
+            d.isoformat(),
+            {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0},
+        )
+        if d.isoformat() in per_day:
+            days_logged += 1
+        for key in week_total:
+            week_total[key] += t[key]
+        table.append(
+            {
+                "Day": d.strftime("%a %d %b"),
+                "Calories": round(t["calories"]),
+                "Protein (g)": round(t["protein_g"]),
+                "Carbs (g)": round(t["carbs_g"]),
+                "Fat (g)": round(t["fat_g"]),
+            }
+        )
+
+    st.dataframe(table, hide_index=True, use_container_width=True)
+
+    # --- Weekly totals -------------------------------------------------
+    st.subheader("Week total")
+    st.write(f"**Calories:** {week_total['calories']:.0f} kcal")
+    st.write(f"**Protein:** {week_total['protein_g']:.0f} g")
+    st.write(f"**Carbs:** {week_total['carbs_g']:.0f} g")
+    st.write(f"**Fat:** {week_total['fat_g']:.0f} g")
+
+    # --- Daily averages (over the days you actually logged) ------------
+    st.subheader("Daily average")
+    if days_logged == 0:
+        st.info("Nothing logged this week yet.")
+        return
+
+    avg_cal = week_total["calories"] / days_logged
+    avg_prot = week_total["protein_g"] / days_logged
+    st.caption(f"Averaged over {days_logged} logged day(s).")
+    targets = get_targets() or {}
+    # Reuse the range rows so the average is graded against your targets.
+    _range_row(
+        "Avg calories/day", avg_cal,
+        targets.get("calorie_min"), targets.get("calorie_max"), "kcal", "ceiling",
+    )
+    _range_row(
+        "Avg protein/day", avg_prot,
+        targets.get("protein_min"), targets.get("protein_max"), "g", "floor",
+    )
 
 
 # ----------------------------------------------------------------------
@@ -617,11 +739,17 @@ def main():
     st.set_page_config(page_title="Calorie & Macro Tracker", page_icon="🥗")
     st.title("🥗 Calorie & Macro Tracker")
 
-    page = st.sidebar.radio("Go to", ["Log Food", "Dashboard"])
+    page = st.sidebar.radio(
+        "Go to", ["Log Food", "Dashboard", "Calendar", "Weekly summary"]
+    )
     if page == "Log Food":
         page_log_food()
-    else:
+    elif page == "Dashboard":
         page_dashboard()
+    elif page == "Calendar":
+        page_calendar()
+    else:
+        page_weekly()
 
 
 if __name__ == "__main__":
