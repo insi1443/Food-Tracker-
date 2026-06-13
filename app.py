@@ -96,13 +96,14 @@ def get_today_totals():
 
 
 def get_today_logs():
-    """Return today's individual log rows, newest first, for a small table."""
+    """Return today's individual log rows, newest first.
+    The first column is the row `id`, which we need in order to delete it."""
     today = date.today().isoformat()
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT meal_type, food_name, quantity_g, calories, protein_g, carbs_g, fat_g
+        SELECT id, meal_type, food_name, quantity_g, calories, protein_g, carbs_g, fat_g
         FROM logs
         WHERE date = ?
         ORDER BY id DESC
@@ -112,6 +113,15 @@ def get_today_logs():
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def delete_log(log_id):
+    """Delete a single log entry by its row id."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM logs WHERE id = ?", (log_id,))
+    conn.commit()
+    conn.close()
 
 
 def save_food_and_log(food, quantity_g, meal_type):
@@ -578,14 +588,24 @@ def page_dashboard():
     _progress_row("Carbs", totals["carbs_g"], targets.get("carb_target"), "g")
     _progress_row("Fat", totals["fat_g"], targets.get("fat_target"), "g")
 
-    # A small table of everything logged today.
+    # A list of everything logged today, each with a delete button.
     st.subheader("Today's entries")
     logs = get_today_logs()
     if logs:
-        # Turn each row tuple into a dict so the table shows readable headers.
-        columns = ["Meal", "Food", "Qty (g)", "Calories", "Protein", "Carbs", "Fat"]
-        table = [dict(zip(columns, row)) for row in logs]
-        st.dataframe(table, hide_index=True, use_container_width=True)
+        for row in logs:
+            log_id, meal, food, qty, cal, prot, carb, fat = row
+            # Two columns: the entry text, and a small delete button.
+            text_col, btn_col = st.columns([6, 1])
+            with text_col:
+                st.write(
+                    f"**{meal.title()}** — {food}  ·  {qty:.0f} g  ·  "
+                    f"{cal:.0f} kcal  ·  {prot:.0f}P / {carb:.0f}C / {fat:.0f}F"
+                )
+            with btn_col:
+                # key must be unique per row, so we use the log id.
+                if st.button("🗑️", key=f"del_{log_id}", help="Delete this entry"):
+                    delete_log(log_id)
+                    st.rerun()  # reload the page so totals + list update
     else:
         st.info("Nothing logged yet today. Head to 'Log Food' to add something.")
 
